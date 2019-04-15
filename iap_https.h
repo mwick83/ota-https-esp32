@@ -120,7 +120,7 @@ int iap_https_init(iap_https_config_t *config);
 // Manually trigger a firmware update check.
 // Queries the server for a firmware update and, if one is available, installs it.
 // If automatic checks are enabled, calling this function causes the timer to be re-set.
-int iap_https_check_now();
+int iap_https_check_now(bool force);
 
 // Returns 1 if an update is currently in progress, 0 otherwise.
 int iap_https_update_in_progress();

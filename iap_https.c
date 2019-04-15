@@ -60,7 +60,8 @@ static ota_http_request_t http_firmware_data_request;
 
 // The event group for our processing task.
 #define FWUP_CHECK_FOR_UPDATE (1 << 0)
-#define FWUP_DOWNLOAD_IMAGE   (1 << 1)
+#define FWUP_FORCE_UPDATE     (1 << 1)
+#define FWUP_DOWNLOAD_IMAGE   (1 << 2)
 static EventGroupHandle_t iap_https_event_group;
 
 // The event group for WiFi connection state
@@ -74,10 +75,12 @@ static int has_iap_session;
 static int has_new_firmware;
 static int total_nof_bytes_received;
 
+static bool force_update;
+
 static void iap_https_periodic_check_timer_callback(TimerHandle_t xTimer);
 static void iap_https_task(void *pvParameter);
 static void iap_https_prepare_timer();
-static void iap_https_trigger_processing();
+static void iap_https_trigger_processing(bool force);
 static void iap_https_check_for_update();
 static void iap_https_download_image();
 
@@ -144,10 +147,10 @@ int iap_https_init(iap_https_config_t *config)
     return 0;
 }
 
-int iap_https_check_now()
+int iap_https_check_now(bool force)
 {
     ESP_LOGD(TAG, "iap_https_check_now");
-    iap_https_trigger_processing();
+    iap_https_trigger_processing(force);
     return 0;
 }
 
@@ -164,16 +167,16 @@ int iap_https_new_firmware_installed()
 static void iap_https_periodic_check_timer_callback(TimerHandle_t xTimer)
 {
     //xEventGroupSetBits(iap_https_event_group, FWUP_CHECK_FOR_UPDATE);
-    iap_https_trigger_processing();
+    iap_https_trigger_processing(false);
 }
 
-static void iap_https_trigger_processing()
+static void iap_https_trigger_processing(bool force)
 {
     static iap_https_event_t callbackEvent;
 
     ESP_LOGD(TAG, "iap_https_trigger_processing: checking flag");
     
-    if (xEventGroupGetBits(iap_https_event_group) & FWUP_CHECK_FOR_UPDATE) {
+    if (xEventGroupGetBits(iap_https_event_group) & (FWUP_CHECK_FOR_UPDATE | FWUP_FORCE_UPDATE )) {
         ESP_LOGD(TAG, "iap_https_trigger_processing: flag is already set");
         return;
     }
@@ -186,7 +189,11 @@ static void iap_https_trigger_processing()
     ESP_LOGD(TAG, "iap_https_trigger_processing: flag is not set, setting it");
 
     // Trigger processing in our task.
-    xEventGroupSetBits(iap_https_event_group, FWUP_CHECK_FOR_UPDATE);
+    if(!force) {
+        xEventGroupSetBits(iap_https_event_group, FWUP_CHECK_FOR_UPDATE);
+    } else {
+        xEventGroupSetBits(iap_https_event_group, FWUP_FORCE_UPDATE);
+    }
 }
 
 static void iap_https_task(void *pvParameter)
@@ -206,7 +213,7 @@ static void iap_https_task(void *pvParameter)
 
         BaseType_t clearOnExit = pdFALSE;
         BaseType_t waitForAllBits = pdFALSE;
-        EventBits_t bits = xEventGroupWaitBits(iap_https_event_group, FWUP_CHECK_FOR_UPDATE | FWUP_DOWNLOAD_IMAGE, clearOnExit, waitForAllBits, portMAX_DELAY);
+        EventBits_t bits = xEventGroupWaitBits(iap_https_event_group, FWUP_CHECK_FOR_UPDATE | FWUP_FORCE_UPDATE | FWUP_DOWNLOAD_IMAGE, clearOnExit, waitForAllBits, portMAX_DELAY);
         
         xEventGroupWaitBits(iap_https_wifi_event_group, IAP_HTTPS_WIFI_STA_EVENT_GROUP_CONNECTED_FLAG, pdFALSE, pdFALSE, portMAX_DELAY);
 
@@ -219,8 +226,9 @@ static void iap_https_task(void *pvParameter)
             // ESP_LOGI(TAG, "DUMMY!!! Firmware updater task will now download the new firmware image.");
             xEventGroupClearBits(iap_https_event_group, FWUP_DOWNLOAD_IMAGE);
             
-        } else if (bits & FWUP_CHECK_FOR_UPDATE) {
+        } else if (bits & (FWUP_CHECK_FOR_UPDATE | FWUP_FORCE_UPDATE)) {
             ESP_LOGI(TAG, "Firmware updater task checking for firmware update.");
+            force_update = ((bits & FWUP_FORCE_UPDATE) != 0);
             iap_https_check_for_update();
 
             // If periodic OTA update checks are enabled, re-start the timer.
@@ -229,7 +237,7 @@ static void iap_https_task(void *pvParameter)
             // immediately check again.
             
             iap_https_prepare_timer();
-            xEventGroupClearBits(iap_https_event_group, FWUP_CHECK_FOR_UPDATE);
+            xEventGroupClearBits(iap_https_event_group, (FWUP_CHECK_FOR_UPDATE | FWUP_FORCE_UPDATE));
         }
     }
 }
@@ -399,8 +407,9 @@ ota_http_continue_receiving_t iap_https_metadata_body_callback(struct ota_http_r
     }
 
     // --- Check if the version on the server is the same as the currently installed version ---
+    // --- or if this is a forced update ---
     
-    if (0 == (strcmp(version, fwupdater_config->current_software_version))) {
+    if ((!force_update) && (0 == (strcmp(version, fwupdater_config->current_software_version)))) {
         ESP_LOGD(TAG, "iap_https_metadata_body_callback: we're up-to-date!");
 
         if (fwupdater_config->event_callback) {
@@ -411,8 +420,8 @@ ota_http_continue_receiving_t iap_https_metadata_body_callback(struct ota_http_r
         return OTA_HTTP_STOP_RECEIVING;
     }
 
-    ESP_LOGD(TAG, "iap_https_metadata_body_callback: our version is %s, the version on the server is %s",
-             fwupdater_config->current_software_version, version);
+    ESP_LOGD(TAG, "iap_https_metadata_body_callback: our version is %s, the version on the server is %s, force_update is %d",
+             fwupdater_config->current_software_version, version, force_update ? 1 : 0);
 
     // --- Request the firmware image ---
 
